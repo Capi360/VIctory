@@ -81,7 +81,11 @@ fn build_valu_cs(body: &[u32]) -> HostShader {
     words.extend_from_slice(body);
     words.extend_from_slice(&buffer_store_dword(0, 8, 0));
     words.push(S_ENDPGM);
+    lower_cs(&words)
+}
 
+/// Lowers a synthetic program with four root constants and a UAV table.
+fn lower_cs(words: &[u32]) -> HostShader {
     let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
     let native = NativeProgram {
         stage: HwStage::Cs,
