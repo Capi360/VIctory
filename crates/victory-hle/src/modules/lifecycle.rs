@@ -183,6 +183,10 @@ extern "system" fn window_proc(
     if message == wm::WM_SYSCOMMAND && wparam & 0xFFF0 == wm::SC_KEYMENU as usize {
         return 0;
     }
+    if message == wm::WM_KEYDOWN && lparam & (1 << 30) == 0 {
+        // Ignore autorepeat. Physical held keys are polled separately.
+        super::gameinput::note_window_key(wparam);
+    }
     // SAFETY: the procedure `hook` stored, called the way the system would.
     unsafe {
         let title = wm::GetPropW(hwnd, TITLE_PROC);

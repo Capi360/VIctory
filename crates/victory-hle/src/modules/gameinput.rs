@@ -1067,9 +1067,13 @@ pub(crate) fn module() -> HleModule {
     }
 }
 
+#[cfg(windows)]
+pub(crate) use host::note_window_key;
+
 /// Host input: XInput pads, the keyboard while our process has focus.
 #[cfg(windows)]
 mod host {
+    use std::sync::Mutex;
     use std::time::{Duration, Instant};
 
     use windows_sys::Win32::System::Threading::GetCurrentProcessId;
@@ -1092,6 +1096,31 @@ mod host {
 
     /// Asking XInput about an empty slot is slow; look again this often.
     const EMPTY_SLOT_RECHECK: Duration = Duration::from_secs(1);
+
+    // A mapped button tap can start and end between two game frames.
+    const TAP_WINDOW: Duration = Duration::from_millis(100);
+    static WINDOW_KEYS: Mutex<[Option<Instant>; FALLBACK_BUTTONS.len()]> =
+        Mutex::new([None; FALLBACK_BUTTONS.len()]);
+
+    pub(crate) fn note_window_key(key: usize) {
+        remember_window_key(key, Instant::now());
+    }
+
+    fn remember_window_key(key: usize, now: Instant) {
+        if let Some(index) = FALLBACK_BUTTONS.iter().position(|&(vk, _)| usize::from(vk) == key) {
+            WINDOW_KEYS.lock().unwrap_or_else(|e| e.into_inner())[index] = Some(now + TAP_WINDOW);
+        }
+    }
+
+    fn window_keys(now: Instant) -> Vec<u8> {
+        WINDOW_KEYS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .zip(FALLBACK_BUTTONS)
+            .filter_map(|(until, (vk, _))| until.is_some_and(|until| now < until).then_some(vk))
+            .collect()
+    }
 
     const BUTTONS: [(u16, u32); 14] = [
         (XINPUT_GAMEPAD_START, MENU),
@@ -1153,6 +1182,11 @@ mod host {
             #[cfg(not(feature = "diagnostics"))]
             let mut down = Vec::new();
             if focused() {
+                for vk in window_keys(Instant::now()) {
+                    if !down.contains(&vk) {
+                        down.push(vk);
+                    }
+                }
                 // Left/right modifier keys only, as devices report them; no
                 // mouse buttons (below 0x08).
                 let held: Vec<u8> = (0x08..=0xFE_u8)
@@ -1231,6 +1265,14 @@ mod host {
             GetWindowThreadProcessId(GetForegroundWindow(), &mut process);
             process == GetCurrentProcessId()
         }
+    }
+
+    #[test]
+    fn a_window_button_tap_survives_more_than_one_frame() {
+        let now = Instant::now();
+        remember_window_key(0x0d, now);
+        assert!(window_keys(now + Duration::from_millis(70)).contains(&0x0d));
+        assert!(!window_keys(now + TAP_WINDOW).contains(&0x0d));
     }
 
     #[test]
