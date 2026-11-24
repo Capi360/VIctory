@@ -619,7 +619,7 @@ mod tests {
         };
         // As `draw.rs` executes indirect draws: clamp, bind, execute.
         let indirect = |list: &HostList| {
-            assert!(crate::indirect::bound(list, &buffer, gpu + 256, (0, 16, 1)));
+            assert!(crate::indirect::clamp_uav(list, &buffer, gpu + 256, (0, 16, 1)));
             bind(list);
             crate::indirect::execute(list, &signature, 1, (&buffer, 256), None);
         };

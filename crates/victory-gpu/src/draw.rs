@@ -1194,6 +1194,8 @@ impl State {
                 )
             };
             prepared.after_draw(list);
+            #[cfg(feature = "diagnostics")]
+            once!("queued an indirect rectangle draw");
             DRAWN.fetch_add(1, Ordering::Relaxed);
             return true;
         }
