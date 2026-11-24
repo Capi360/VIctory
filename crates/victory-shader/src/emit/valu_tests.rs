@@ -193,11 +193,12 @@ fn run_cases(
         for (i, &inputs) in cases.iter().enumerate() {
             let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
             for u in &shader.user_data {
-                ud[u.index as usize] = match (u.root, u.slot) {
-                    (RootType::Constants, 0) => inputs[u.dword as usize],
-                    (RootType::Table, 1) => 0,
-                    other => panic!("unexpected user data {other:?}"),
-                };
+                ud[u.index as usize] =
+                    super::host::guard(u.root, 1, 0).unwrap_or_else(|| match (u.root, u.slot) {
+                        (RootType::Constants, 0) => inputs[u.dword as usize],
+                        (RootType::Table, 1) => 0,
+                        other => panic!("unexpected user data {other:?}"),
+                    });
             }
             let out = host
                 .dispatch(

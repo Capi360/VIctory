@@ -900,6 +900,18 @@ mod tests {
         }
     }
 
+    /// User data for tests with four root constants and a table at slot zero.
+    #[cfg(windows)]
+    fn stride_test_constants(shader: &HostShader, views: usize, first: u32) -> super::host::Root {
+        let mut words = vec![0; shader.user_data_dwords() as usize];
+        for u in &shader.user_data {
+            words[u.index as usize] = super::host::guard(u.root, views, 0).unwrap_or_else(|| {
+                u32::from(u.root == crate::RootType::Constants && u.dword == 0) * first
+            });
+        }
+        super::host::Root::Constants(words)
+    }
+
     /// Held while a test here dispatches: two GPU tests at once on WARP can
     /// end the test process with an access violation (see
     /// `valu_tests::ONE_AT_A_TIME`).
@@ -1032,7 +1044,8 @@ mod tests {
             for slot in 0..2 {
                 let entry = match elements {
                     Some((first, count)) => {
-                        let (raw, entry) = raw_view_of(slot, 2 + slot as u32, (first, count, stride));
+                        let (raw, entry) =
+                            raw_view_of(slot, 2 + slot as u32, (first, count, stride));
                         views.push(raw);
                         entry
                     }
@@ -1049,7 +1062,7 @@ mod tests {
                     &pso,
                     &Dispatch {
                         roots: vec![
-                            (0, Root::Constants(vec![0, 0, 0, 0, 0])),
+                            (0, stride_test_constants(&cs, views.len(), 0)),
                             (
                                 1,
                                 Root::View {
@@ -1170,13 +1183,30 @@ mod tests {
                 // The slot each of the two groups reads, in the buffer in
                 // slot 0.
                 for (slots, want) in [([2, 3], [of_a, of_b]), ([3, 2], [of_b, of_a])] {
+                    let views = [
+                        View::Buffer {
+                            data: &slots,
+                            stride: Stride::Raw,
+                        },
+                        View::RawUav(8),
+                        View::Buffer {
+                            data: &a,
+                            stride: Stride::Structured(12),
+                        },
+                        View::Buffer {
+                            data: &b,
+                            stride: Stride::Structured(16),
+                        },
+                        raw_a,
+                        raw_b,
+                    ];
                     let out = host
                         .dispatch(
                             &root,
                             &pso,
                             &Dispatch {
                                 roots: vec![
-                                    (0, Root::Constants(vec![0, 0, 0, 0, 0])),
+                                    (0, stride_test_constants(&cs, views.len(), 0)),
                                     (
                                         1,
                                         Root::View {
@@ -1185,23 +1215,7 @@ mod tests {
                                         },
                                     ),
                                 ],
-                                views: &[
-                                    View::Buffer {
-                                        data: &slots,
-                                        stride: Stride::Raw,
-                                    },
-                                    View::RawUav(8),
-                                    View::Buffer {
-                                        data: &a,
-                                        stride: Stride::Structured(12),
-                                    },
-                                    View::Buffer {
-                                        data: &b,
-                                        stride: Stride::Structured(16),
-                                    },
-                                    raw_a,
-                                    raw_b,
-                                ],
+                                views: &views,
                                 samplers: &[],
                                 groups: [2, 1, 1],
                             },
@@ -1264,13 +1278,26 @@ mod tests {
                 let (root, pso) = host.compute_pipeline(&cs).unwrap();
                 // s0: 1 takes the first load, 0 the second.
                 for (s0, want) in [(1, 107), (0, 209)] {
+                    let views = [
+                        View::Buffer {
+                            data: &a,
+                            stride: Stride::Structured(12),
+                        },
+                        View::Buffer {
+                            data: &b,
+                            stride: Stride::Structured(16),
+                        },
+                        View::RawUav(16),
+                        raw_a,
+                        raw_b,
+                    ];
                     let out = host
                         .dispatch(
                             &root,
                             &pso,
                             &Dispatch {
                                 roots: vec![
-                                    (0, Root::Constants(vec![s0, 0, 0, 0, 0])),
+                                    (0, stride_test_constants(&cs, views.len(), s0)),
                                     (
                                         1,
                                         Root::View {
@@ -1279,19 +1306,7 @@ mod tests {
                                         },
                                     ),
                                 ],
-                                views: &[
-                                    View::Buffer {
-                                        data: &a,
-                                        stride: Stride::Structured(12),
-                                    },
-                                    View::Buffer {
-                                        data: &b,
-                                        stride: Stride::Structured(16),
-                                    },
-                                    View::RawUav(16),
-                                    raw_a,
-                                    raw_b,
-                                ],
+                                views: &views,
                                 samplers: &[],
                                 groups: [1, 1, 1],
                             },

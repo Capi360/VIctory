@@ -201,9 +201,16 @@ fn dispatch(
     heap: &HostHeap,
     root: &ID3D12RootSignature,
     pso: &ID3D12PipelineState,
-    user_data: u32,
+    cs: &HostShader,
 ) -> windows::core::Result<()> {
-    let zeros = vec![0u32; user_data as usize];
+    let mut user_data = vec![0; cs.user_data_dwords() as usize];
+    for guard in cs
+        .user_data
+        .iter()
+        .filter(|u| u.root == RootType::ResourceHeap)
+    {
+        user_data[guard.index as usize] = heap.guard_slot();
+    }
     // SAFETY: an open list with every root argument set; the heap, its
     // table and the buffers its views read outlive the wait.
     unsafe {
@@ -217,7 +224,7 @@ fn dispatch(
             device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, pso)?;
         list.SetDescriptorHeaps(&[Some(heap.heap.clone())]);
         list.SetComputeRootSignature(root);
-        list.SetComputeRoot32BitConstants(0, user_data, zeros.as_ptr().cast(), 0);
+        list.SetComputeRoot32BitConstants(0, cs.user_data_dwords(), user_data.as_ptr().cast(), 0);
         list.SetComputeRootShaderResourceView(1, heap.stride_table_gpu().expect("a table"));
         list.Dispatch(2, 1, 1);
         list.Close()?;
@@ -320,7 +327,7 @@ fn unknown_stride_reads_reach_the_bytes_of_the_view_in_the_slot() {
         unsafe {
             slots_copy.cast::<[u32; 2]>().write(chosen);
             out.add(5).cast::<[u32; 8]>().write([0; 8]);
-            dispatch(device, &heap, &root, &pso, cs.user_data_dwords()).expect("a dispatch");
+            dispatch(device, &heap, &root, &pso, &cs).expect("a dispatch");
             out.add(5).cast::<[u32; 8]>().read()
         }
     };
@@ -329,6 +336,7 @@ fn unknown_stride_reads_reach_the_bytes_of_the_view_in_the_slot() {
     let (twelve, typed) = ([110, 113, 116, 0], [109, 113, 117, 121]);
     assert_eq!(run([2, 3]), [twelve, typed].concat()[..]);
     assert_eq!(run([3, 2]), [typed, twelve].concat()[..]);
+    assert_eq!(run([heap.guard_slot(), 3]), [[0; 4], typed].concat()[..]);
 
     // The title rebinds the slots: slot 2 to four elements of 20 bytes from
     // element 1 (in the raw view slot it had), slot 3 to a raw view from
@@ -369,6 +377,10 @@ fn retiring_slot_is_unavailable_until_its_alias_is_cleared() {
         eprintln!("Skipping descriptor retirement test: no host view heap");
         return;
     };
+    // SAFETY: a live heap.
+    let slots = unsafe { heap.heap.GetDesc().NumDescriptors };
+    assert_eq!(heap.guard_slot(), slots - 1);
+    assert!(heap.guard_slot() > heap.alias_base() + 1);
     let capacity = heap.alias_base() - heap.count();
     let first = heap.dynamic(capacity).expect("empty dynamic pool");
     let last = first + capacity - 1;

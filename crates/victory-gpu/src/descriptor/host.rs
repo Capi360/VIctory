@@ -239,7 +239,9 @@ impl HostHeap {
         let strides = if sampler {
             None
         } else {
-            StrideTable::new(&host.device, count + extra)
+            // A clamped descriptor index can reach the guard. Its stride
+            // entry must be inside the upload buffer too.
+            StrideTable::new(&host.device, count + extra + reserved)
         };
         let h = HostHeap {
             heap,
@@ -270,6 +272,13 @@ impl HostHeap {
         if !sampler {
             null_buffer_view(h.cpu(h.alias_base));
             null_raw_uav(h.cpu(h.alias_base + 1));
+            h.set_entry(
+                h.guard_slot(),
+                StrideEntry {
+                    raw_slot: Some(h.null_alias(false)),
+                    ..StrideEntry::default()
+                },
+            );
         }
         tracing::debug!(
             ms = started.elapsed().as_millis(),

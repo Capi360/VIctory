@@ -177,8 +177,8 @@ struct Lower<'a> {
     interps: HashMap<Site, &'a Interp>,
     handles: HashMap<(usize, Site, u8, bool, u32), V>,
     /// Runtime stride table entries read in a block, by the descriptor's
-    /// load: the raw slot, the stride and the bias.
-    entries: HashMap<(usize, Site, u8), [V; 3]>,
+    /// load: the raw slot, stride, bias, and original heap slot.
+    entries: HashMap<(usize, Site, u8), [V; 4]>,
     /// Blocks splitting the edge from one IR block to another.
     edges: HashMap<(usize, usize), usize>,
     /// Per IR block: a `done` export is behind every lane entering it.
@@ -4834,7 +4834,7 @@ impl<'a> Lower<'a> {
     /// current block: the slot holding a raw view of the buffer's bytes
     /// (the slot itself when the table names none), the stride and the bias
     /// ([`super::StrideEntry`]).
-    fn stride_entry(&mut self, src: &Source) -> Result<[V; 3], Why> {
+    fn stride_entry(&mut self, src: &Source) -> Result<[V; 4], Why> {
         let key = match src {
             Source::Loaded { load, first } => Some((self.cur, *load, *first)),
             _ => None,
@@ -4874,7 +4874,7 @@ impl<'a> Lower<'a> {
         let raw = self.s.m.select(c, own, slot, named);
         let k = self.s.m.i32(28);
         let bias = self.s.m.bin(c, Bin::LShr, word, k);
-        let e = [raw, stride, bias];
+        let e = [raw, stride, bias, slot];
         if let Some(k) = key {
             self.entries.insert(k, e);
         }
@@ -4892,15 +4892,20 @@ impl<'a> Lower<'a> {
     /// shortcut: the console reads zeros (and drops writes) where `off` and
     /// the access pass the element's end; here they reach the next element,
     /// as the statically known strides' structured accesses may.
-    fn runtime_view(
-        &mut self,
-        src: &Source,
-        index: V,
-        off: V,
-        props: u32,
-    ) -> Result<(V, V), Why> {
-        let [raw, stride, bias] = self.stride_entry(src)?;
+    fn runtime_view(&mut self, src: &Source, index: V, off: V, props: u32) -> Result<(V, V), Why> {
+        let [raw, stride, bias, slot] = self.stride_entry(src)?;
         let c = self.cur;
+        let raw = if props & 0x1000 != 0 {
+            // The guard's stride entry names the null raw SRV. The
+            // matching UAV is the next slot in the raw alias range.
+            let guard = self.guard_slots[0].ok_or("a stride table without a view guard")?;
+            let at_guard = self.s.m.cmp(c, pred::EQ, slot, guard);
+            let one = self.s.m.i32(1);
+            let null_uav = self.s.m.bin(c, Bin::Add, raw, one);
+            self.s.m.select(c, at_guard, null_uav, raw)
+        } else {
+            raw
+        };
         let element = self.s.m.bin(c, Bin::Mul, index, stride);
         let byte = self.s.m.bin(c, Bin::Add, element, off);
         let byte = self.s.m.bin(c, Bin::Add, byte, bias);
