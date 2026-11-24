@@ -4414,8 +4414,15 @@ impl<'a> Lower<'a> {
                     })
                 })
         };
-        let use_at =
-            uses(&|load| load == site).or_else(|| uses(&|load| self.twin_loads(site, load)));
+        let use_at = uses(&|load| load == site).or_else(|| {
+            // Keep graphics stages on their declared resource metadata until
+            // twin loads can be matched without changing their signatures.
+            if self.x.native.stage == HwStage::Cs {
+                uses(&|load| self.twin_loads(site, load))
+            } else {
+                None
+            }
+        });
         let (src, uav, props, image) = if let Some((at, first)) = use_at {
             let src = Source::Loaded { load: site, first };
             let used = self.used_kind(&src);
