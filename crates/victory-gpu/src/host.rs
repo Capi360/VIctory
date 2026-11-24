@@ -62,8 +62,48 @@ unsafe impl Send for Host {}
 unsafe impl Sync for Host {}
 
 /// Time spent in submissions since the last frame-rate line, in
-/// microseconds: preparing them on the CPU (title memory copies, texture
-/// detiling), then waiting for the GPU.
+/// Host objects the title let go of while a submission may still use them
+/// (a texture its descriptors name, a descriptor slot's old resource), by
+/// the submission count they wait for. The title's descriptor writes and
+/// releases reach the host at once, from its own threads, while the host
+/// runs a submission for most of a second in the world: freeing there was
+/// a GPU page fault on the freed texture (DXGI_ERROR_DEVICE_HUNG,
+/// 2026-11-24, RX 7600).
+type Retired = (u64, Box<dyn std::any::Any + Send>);
+static RETIRED: Mutex<Vec<Retired>> = Mutex::new(Vec::new());
+/// Submissions started and finished (waited for).
+static STARTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static FINISHED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Drops `object` once every submission running now has finished: at once
+/// if none is.
+pub(crate) fn retire<T: Send + 'static>(object: T) {
+    // Serialize the completion check and enqueue with bury. Otherwise a
+    // finishing submission can drain the queue just before we enqueue.
+    let mut retired = RETIRED.lock().unwrap_or_else(|e| e.into_inner());
+    let started = STARTED.load(Ordering::Acquire);
+    if started > FINISHED.load(Ordering::Acquire) {
+        retired.push((started, Box::new(object)));
+    }
+}
+
+/// Drops what waited for submissions up to `finished`.
+fn bury(finished: u64) {
+    let done: Vec<Retired> = {
+        let mut retired = RETIRED.lock().unwrap_or_else(|e| e.into_inner());
+        if retired.is_empty() {
+            return;
+        }
+        let (done, keep) = std::mem::take(&mut *retired)
+            .into_iter()
+            .partition(|(at, _)| *at <= finished);
+        *retired = keep;
+        done
+    };
+    drop(done);
+}
+
+/// Microseconds preparing submissions on the CPU, then waiting for the GPU.
 static SUBMISSION_US: [std::sync::atomic::AtomicU64; 2] =
     [std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0)];
 
@@ -542,6 +582,7 @@ impl Host {
         // One submission at a time from preparation to copy-back: snapshots
         // and the ranges shaders write are per host copy, not per submission.
         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        let this_submission = STARTED.fetch_add(1, Ordering::AcqRel) + 1;
         let started = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::Submissions, 1);
@@ -602,6 +643,8 @@ impl Host {
             let _ = (i, started);
         }
         let _ = &firsts;
+        FINISHED.store(this_submission, Ordering::Release);
+        bury(this_submission);
         let gpu = prepared.elapsed();
         SUBMISSION_US[0].fetch_add((prepared - started).as_micros() as u64, Ordering::Relaxed);
         SUBMISSION_US[1].fetch_add(gpu.as_micros() as u64, Ordering::Relaxed);
