@@ -15,8 +15,8 @@
 //! shortcut: writes into physical pages through another view (xmem's
 //! `write_physical`, DirectStorage's page destinations) are not seen at
 //! the guarded addresses; they go to the texture pool, whose textures are
-//! hashed, not guarded. A system call writing into a guarded block fails
-//! (none is known to).
+//! hashed, not guarded. The runtime must keep view blocks writable for the
+//! duration of a synchronous read that writes through the kernel.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Mutex;
@@ -108,11 +108,14 @@ struct Guards {
     protected: BTreeSet<usize>,
     /// Of those, the ones not written since a copy took them.
     clean: BTreeSet<usize>,
+    /// Active kernel writes by half-open block range, including duplicates.
+    pending: BTreeMap<(usize, usize), usize>,
 }
 
 static GUARDS: Mutex<Guards> = Mutex::new(Guards {
     protected: BTreeSet::new(),
     clean: BTreeSet::new(),
+    pending: BTreeMap::new(),
 });
 
 fn guards() -> std::sync::MutexGuard<'static, Guards> {
@@ -136,16 +139,30 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
     let mut written = Vec::new();
     let mut run: Option<usize> = None;
     let (first, last) = (start / BLOCK, end.div_ceil(BLOCK));
+    let pending: Vec<_> = g
+        .pending
+        .range(..(last, 0))
+        .map(|(&range, _)| range)
+        .filter(|&(_, to)| to > first)
+        .collect();
+    let mut pending = pending.into_iter().peekable();
+    let mut writable_until = first;
     for block in first..=last {
-        let open = block < last && !g.clean.contains(&block);
-        if open {
+        while let Some((_, to)) = pending.next_if(|&(from, _)| from <= block) {
+            writable_until = writable_until.max(to);
+        }
+        let writing = block < writable_until;
+        if block < last && (writing || !g.clean.contains(&block)) {
             written.extend(block * BLOCK / PAGE..(block + 1) * BLOCK / PAGE);
-            if g.protected.contains(&block) {
-                // Written through the runtime, still read-only.
-                g.clean.insert(block);
-            } else {
-                run.get_or_insert(block);
-                continue;
+            // Keep reporting an in-flight block as dirty without protecting it.
+            if !writing {
+                if g.protected.contains(&block) {
+                    // Written through the runtime, still read-only.
+                    g.clean.insert(block);
+                } else {
+                    run.get_or_insert(block);
+                    continue;
+                }
             }
         }
         if let Some(from) = run.take() {
@@ -214,13 +231,57 @@ pub fn writing(at: usize, len: usize) {
     open(&mut guards(), at, at.saturating_add(len));
 }
 
+/// Keeps a destination writable until the synchronous kernel operation returns.
+#[must_use = "keep the guard alive until the kernel finishes writing"]
+pub struct KernelWrite {
+    blocks: (usize, usize),
+}
+
+/// Opens `[at, at + len)` and pins its write access for the guard's lifetime.
+pub fn begin_kernel_write(at: usize, len: usize) -> Option<KernelWrite> {
+    let end = at.saturating_add(len);
+    if at >= end {
+        return None;
+    }
+    let blocks = (at / BLOCK, end.div_ceil(BLOCK));
+    let mut g = guards();
+    open(&mut g, at, end);
+    *g.pending.entry(blocks).or_default() += 1;
+    Some(KernelWrite { blocks })
+}
+
+impl Drop for KernelWrite {
+    fn drop(&mut self) {
+        if let std::collections::btree_map::Entry::Occupied(mut entry) =
+            guards().pending.entry(self.blocks)
+        {
+            *entry.get_mut() -= 1;
+            if *entry.get() == 0 {
+                entry.remove();
+            }
+        }
+    }
+}
+
 /// The runtime mapped or unmapped title memory `[at, at + len)`: what it
 /// shows is new and read-write, so it is no longer guarded.
 pub fn title_memory_remapped(at: usize, len: usize) {
+    let end = at.saturating_add(len);
+    // Keep the same lock order as `writes`. A new mapping can reuse an
+    // address and must start without the previous mapping's write history.
+    let mut journal = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    let pages: Vec<_> = journal
+        .written
+        .range(at / PAGE..end.div_ceil(PAGE))
+        .map(|(&page, _)| page)
+        .collect();
+    for page in pages {
+        journal.written.remove(&page);
+    }
     let mut g = guards();
     let blocks: Vec<usize> = g
         .protected
-        .range(at / BLOCK..at.saturating_add(len).div_ceil(BLOCK))
+        .range(at / BLOCK..end.div_ceil(BLOCK))
         .copied()
         .collect();
     for block in blocks {
@@ -359,14 +420,22 @@ mod tests {
             file.read(into).is_ok_and(|n| n == 13)
         };
         assert!(!read(&mut file), "the kernel does not fault into our handler");
-        writing(view + 100, 13);
-        assert!(read(&mut file));
+        let first = begin_kernel_write(view + 100, 13).unwrap();
+        let second = begin_kernel_write(view + 100, 13).unwrap();
+        let _ = writes(view, view + 2 * BLOCK, true).unwrap();
+        drop(first);
+        let _ = writes(view, view + 2 * BLOCK, true).unwrap();
+        assert!(read(&mut file), "a refresh must keep the in-flight destination writable");
+        drop(second);
         // SAFETY: the bytes just read.
         assert_eq!(unsafe { std::slice::from_raw_parts((view + 100) as *const u8, 13) }, b"from the disk");
         assert_eq!(guard(view, view + 2 * BLOCK), Some((view / PAGE..view / PAGE + 1).collect()));
+        assert!(!read(&mut file), "finished destinations can be guarded again");
         // SAFETY: our view.
         unsafe { UnmapViewOfFile(windows_sys::Win32::System::Memory::MEMORY_MAPPED_VIEW_ADDRESS { Value: view as *mut _ }) };
         title_memory_remapped(view, 2 * BLOCK);
+        let journal = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(!journal.written.contains_key(&(view / PAGE)));
     }
 
     /// A write or mapping that runs past the end of the address space (a
