@@ -86,6 +86,20 @@ fn build_valu_cs(body: &[u32]) -> HostShader {
 
 /// Lowers a synthetic program with four root constants and a UAV table.
 fn lower_cs(words: &[u32]) -> HostShader {
+    let used = UsedResource {
+        kind: ResourceType::Uav,
+        root: RootType::Table,
+        table_offset_dwords: 0,
+        lower_bound: 0,
+        stride: 0,
+        dwords: 4,
+        user_data: 4,
+        slot: 1,
+    };
+    lower_cs_with_resources(words, vec![used])
+}
+
+fn lower_cs_with_resources(words: &[u32], used: Vec<UsedResource>) -> HostShader {
     let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
     let native = NativeProgram {
         stage: HwStage::Cs,
@@ -109,16 +123,7 @@ fn lower_cs(words: &[u32]) -> HostShader {
                 slot: 1,
             },
         ],
-        used: vec![UsedResource {
-            kind: ResourceType::Uav,
-            root: RootType::Table,
-            table_offset_dwords: 0,
-            lower_bound: 0,
-            stride: 0,
-            dwords: 4,
-            user_data: 4,
-            slot: 1,
-        }],
+        used,
         io: StageIo::Cs(ComputeIo {
             rsrc2: 5 << 1, // 5 user SGPRs: s0..s4
             threads: [1, 1, 1],
@@ -983,5 +988,21 @@ fn a_heap_index_past_the_heap_reads_the_guard_slot() {
     run_cases(&shader, &cases, |label, i, k, got| {
         let want = if i == 0 { 7 } else { 0 };
         assert_eq!(got, want, "{label}: index {:#x}", k[0]);
+    });
+}
+
+/// The second load is used only as data. Its twin supplies the UAV kind
+/// even when the program has no used-resource entry for this table slot.
+#[test]
+fn a_twin_descriptor_load_reports_its_buffer_size() {
+    let mut words = vec![s_mov_b32(5, 0x80)];
+    words.extend_from_slice(&s_load_dwordx4(8, 4));
+    words.extend_from_slice(&s_load_dwordx4(12, 4));
+    words.push(vop1(0x001, 0, sgpr(14)));
+    words.extend_from_slice(&buffer_store_dword(0, 8, 0));
+    words.push(S_ENDPGM);
+    let shader = lower_cs_with_resources(&words, Vec::new());
+    run_cases(&shader, &[[0; 4]], |backend, _, _, got| {
+        assert_eq!(got, 4, "{backend}: byte size of the one-dword UAV");
     });
 }
