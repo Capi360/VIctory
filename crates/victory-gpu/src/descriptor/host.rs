@@ -90,6 +90,8 @@ const DYNAMIC: u32 = 1 << 18;
 /// The dynamic slots of a heap whose host would not take [`DYNAMIC`] more
 /// (a capped heap, NVIDIA): the title's slots keep their room first.
 const MIN_DYNAMIC: u32 = 1 << 16;
+/// Keep the two null buffer descriptors and the last null view out of allocations.
+const RESERVED_VIEWS: u32 = 3;
 
 impl HostHeap {
     pub(crate) fn new(sampler: bool, count: u32) -> Option<Self> {
@@ -131,18 +133,22 @@ impl HostHeap {
                     return None;
                 }
             }
-        } else if let Ok(heap) = make((count + DYNAMIC).max(views)) {
+        } else if let Ok(heap) = make((count + DYNAMIC + RESERVED_VIEWS).max(views)) {
             (heap, count, DYNAMIC)
         } else {
             // shortcut: a host that caps its heaps below `HEAP_VIEWS` (NVIDIA)
             // faults on an index past them, as before the clamp.
-            match make(count + MIN_DYNAMIC) {
+            match make((count + MIN_DYNAMIC + RESERVED_VIEWS).max(views)) {
                 Ok(heap) => (heap, count, MIN_DYNAMIC),
-                Err(e) if count + MIN_DYNAMIC > PORTABLE_VIEWS => {
+                Err(e) if count + MIN_DYNAMIC + RESERVED_VIEWS > PORTABLE_VIEWS => {
                     // shortcut: descriptors past the host's limit are left
                     // out; a title that reaches them needs remapping.
                     tracing::warn!(error = %e, count, "host view heap capped at {PORTABLE_VIEWS}");
-                    (make(PORTABLE_VIEWS).ok()?, PORTABLE_VIEWS - MIN_DYNAMIC, MIN_DYNAMIC)
+                    (
+                        make(PORTABLE_VIEWS).ok()?,
+                        PORTABLE_VIEWS - MIN_DYNAMIC - RESERVED_VIEWS,
+                        MIN_DYNAMIC,
+                    )
                 }
                 Err(e) => {
                     tracing::warn!(error = %e, count, sampler, "no host descriptor heap");
@@ -585,7 +591,7 @@ impl HostHeap {
             // Diagnostic (NVIDIA heap cap): the highest title slot past the
             // host heap seen so far.
             static HIGHEST: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-            if HIGHEST.fetch_max(index, std::sync::atomic::Ordering::Relaxed) < index {
+            if for_draw && HIGHEST.fetch_max(index, std::sync::atomic::Ordering::Relaxed) < index {
                 tracing::warn!(
                     index,
                     count = self.count,
