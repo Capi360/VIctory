@@ -3,7 +3,10 @@
 
 use super::{HostShader, TranslateOptions, Wave64Mode, emit_with, translate_with};
 use crate::dxbc::{Container, FourCC};
-use crate::native::{ComputeIo, HwStage, NativeProgram, RootParam, RootType, StageIo};
+use crate::native::{
+    ComputeIo, HwStage, MeshIo, NativeProgram, PsInput, RootParam, RootType, StageIo, Usage,
+    VsOutput,
+};
 use crate::{ShaderError, io, ir, resource, structure};
 
 const S_ENDPGM: u32 = 0xBF81_0000;
@@ -223,6 +226,144 @@ fn emit_cs(native: &NativeProgram, mode: Wave64Mode) -> Result<HostShader, Shade
         &res,
         TranslateOptions { wave64: mode },
     )
+}
+
+fn make_ms_program(
+    words: &[u32],
+    threads: u32,
+    max_vertices: u32,
+    max_primitives: u32,
+    lds_bytes: u32,
+    outputs: Vec<VsOutput>,
+) -> NativeProgram {
+    NativeProgram {
+        stage: HwStage::Ms,
+        wave64: true,
+        vgprs: 32,
+        layout: Vec::new(),
+        used: Vec::new(),
+        io: StageIo::Ms(MeshIo {
+            outputs,
+            clip_cntl: 0,
+            threads,
+            max_vertices,
+            max_primitives,
+            topology: 2,
+            lds_bytes,
+        }),
+        code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+    }
+}
+
+fn sig_el(
+    name: &str,
+    kind: u8,
+    interp: u8,
+    row: Option<u32>,
+    usage: u8,
+) -> super::container::SigElement {
+    super::container::SigElement {
+        name: name.into(),
+        index: 0,
+        kind,
+        comp: 9,
+        interp,
+        row,
+        col: 0,
+        cols: 4,
+        usage,
+        half: false,
+    }
+}
+
+fn emit_ms(native: &NativeProgram, mode: Wave64Mode) -> Result<HostShader, ShaderError> {
+    let osg1 = super::container::signature(
+        &[
+            sig_el("TEXCOORD", 0, 2, Some(0), 15),
+            sig_el("SV_Position", 3, 4, Some(1), 15),
+        ],
+        false,
+    );
+    let dxbc = crate::dxbc::build(&[(FourCC::OSG1, &osg1)]);
+    let container = Container::parse(&dxbc)?;
+    let p = ir::build(&native.patched_code(), native.wave64, native.vgprs)?;
+    let st = structure::structure(&p);
+    let res = resource::track(&p, &native.layout, native.stage, st.as_ref().ok())?;
+    let io_res = io::raise(&p, native)?;
+    let st = st?;
+    emit_with(
+        &container,
+        native,
+        &p,
+        &st,
+        &io_res,
+        &res,
+        TranslateOptions { wave64: mode },
+    )
+}
+
+fn emit_ps_rgba_passthrough() -> HostShader {
+    // Interpolate attribute 0 channels x..w and export to mrt0.
+    let words = [
+        0xC808_0000u32, // v_interp_p1_f32 v2, v0, attr0.x
+        0xC809_0001,    // v_interp_p2_f32 v2, v1, attr0.x
+        0xC80C_0100,    // v_interp_p1_f32 v3, v0, attr0.y
+        0xC80D_0101,    // v_interp_p2_f32 v3, v1, attr0.y
+        0xC810_0200,    // v_interp_p1_f32 v4, v0, attr0.z
+        0xC811_0201,    // v_interp_p2_f32 v4, v1, attr0.z
+        0xC814_0300,    // v_interp_p1_f32 v5, v0, attr0.w
+        0xC815_0301,    // v_interp_p2_f32 v5, v1, attr0.w
+        0xF800_180F,
+        0x0504_0302, // exp mrt0, v2, v3, v4, v5 done vm
+        S_ENDPGM,
+    ];
+    let native = NativeProgram {
+        stage: HwStage::Ps,
+        wave64: false,
+        vgprs: 8,
+        layout: Vec::new(),
+        used: Vec::new(),
+        io: StageIo::Ps {
+            inputs: vec![PsInput {
+                usage: Usage::Generic,
+                row: 0,
+                mask: 0b1111,
+                attr: 0,
+                flat: false,
+                fp16: false,
+                pack2: false,
+                row2: 0,
+            }],
+            input_addr: 1 << 5,
+            db_shader_control: 0,
+            patches: Vec::new(),
+        },
+        code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+    };
+    let isg1 = super::container::signature(
+        &[
+            sig_el("TEXCOORD", 0, 2, Some(0), 15),
+            sig_el("SV_Position", 3, 4, Some(1), 0),
+        ],
+        true,
+    );
+    let osg1 = super::container::signature(&[sig_el("SV_Target", 16, 0, Some(0), 15)], false);
+    let dxbc = crate::dxbc::build(&[(FourCC::ISG1, &isg1), (FourCC::OSG1, &osg1)]);
+    let container = Container::parse(&dxbc).unwrap();
+    let p = ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
+    let st = structure::structure(&p).unwrap();
+    let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+    let io_res = io::raise(&p, &native).unwrap();
+    emit_with(
+        &container,
+        &native,
+        &p,
+        &st,
+        &io_res,
+        &res,
+        TranslateOptions::default(),
+    )
+    .unwrap()
 }
 
 fn psv_wave_range(shader: &HostShader) -> (u32, u32) {
@@ -652,6 +793,222 @@ fn divergent_multiple_lds_reads_without_writes_succeed() {
     });
     assert!(emit_cs(&small, Wave64Mode::Wave32).is_ok());
     assert!(emit_cs(&small, Wave64Mode::Emulate).is_err());
+}
+
+#[test]
+fn mesh_wave64_masks_cross_lane_and_reductions() {
+    let prog = mesh_wave64_triangle_program();
+    assert!(emit_ms(&prog, Wave64Mode::Native).is_err());
+    for mode in [Wave64Mode::Wave32, Wave64Mode::Emulate] {
+        let mut shader = emit_ms(&prog, mode).unwrap();
+        assert_eq!(psv_wave_range(&shader), (0, u32::MAX));
+        assert_eq!(sfi0_flags(&shader) & 0x4000, 0);
+        #[cfg(windows)]
+        if let Ok(mut validator) = super::validator::Validator::load(
+            super::validator::Validator::default_path().as_deref(),
+        ) {
+            validator.validate(&mut shader.dxil).unwrap();
+        }
+    }
+}
+
+#[test]
+fn mesh_wave64_divergent_non_uniform_readfirstlane() {
+    let mut code = Vec::new();
+    code.extend_from_slice(&v_mbcnt_lo_u32_b32(0, NEG_ONE, inline_u(0)));
+    code.extend_from_slice(&v_mbcnt_hi_u32_b32(0, NEG_ONE, vgpr(0)));
+    code.push(v_mov_b32(1, inline_u(0)));
+    code.push(v_cmp_gt_u32(inline_u(32), 0));
+    code.push(s_and_saveexec_b64(6, VCC));
+    let br = code.len();
+    code.push(0);
+    code.push(v_readfirstlane_b32(4, 0));
+    code.push(v_mov_b32(1, 4));
+    code[br] = s_cbranch_execz((code.len() - (br + 1)) as i16);
+    code.push(s_or_b64(EXEC_LO, EXEC_LO, 6));
+    code.extend_from_slice(&[0xF800_0941, 0x0000_0001]); // exp prim, v1, off, off, off done
+    code.push(S_ENDPGM);
+
+    let prog = make_ms_program(&code, 128, 3, 1, 0, Vec::new());
+    assert!(emit_ms(&prog, Wave64Mode::Wave32).is_ok());
+    assert!(matches!(
+        emit_ms(&prog, Wave64Mode::Emulate),
+        Err(ShaderError::Unsupported { .. })
+    ));
+}
+
+fn mesh_wave64_triangle_program() -> NativeProgram {
+    // 128-thread Wave64 mesh shader (2 virtual 64-lane waves):
+    // - v0 = lane in 0..63 via v_mbcnt_lo/hi(-1)
+    // - v10 = group thread id in 0..127 using s3 (MergedWaveInfo)
+    // - s4 = s_bcnt1((tid & 63) > 34) = 29
+    // - s5 = s_ff1((tid & 63) > 34) = 35
+    // - s6 = dynamic cross-half v_readlane((tid & 63) + 10, lane 32) = 42
+    // Exports a fullscreen triangle with param0 = (29.0, 35.0, 42.0, 1.0).
+    let mut code = Vec::new();
+    code.extend_from_slice(&v_mbcnt_lo_u32_b32(0, NEG_ONE, inline_u(0)));
+    code.extend_from_slice(&v_mbcnt_hi_u32_b32(0, NEG_ONE, vgpr(0)));
+    code.push(sop2(2, 0x20, 3, inline_u(24))); // s_lshr_b32 s2, s3, 24 -> wave index (0 or 1)
+    code.push(sop2(2, 0x1E, 2, inline_u(6))); // s2 = wave * 64
+    code.push(v_add_nc_u32(10, 2, 0)); // v10 = full tid 0..127
+
+    code.push(v_cmp_lt_u32(inline_u(34), 0)); // bits 35..63
+    code.push(s_bcnt1_i32_b64(4, VCC)); // s4 = 29
+    code.push(s_ff1_i32_b64(5, VCC)); // s5 = 35
+
+    code.push(v_add_nc_u32(11, inline_u(10), 0)); // v11 = (tid & 63) + 10 (lane 32 => 42)
+    code.push(v_and_b32(12, inline_u(0), 0));
+    code.push(v_add_nc_u32(12, inline_u(32), 12)); // dynamic VGPR holding 32
+    code.extend_from_slice(&v_readlane_b32(6, 11, vgpr(12))); // s6 = 42
+
+    code.push(vop1(1, 0x06, 4)); // v_cvt_f32_u32 v1, s4 (29.0)
+    code.push(vop1(2, 0x06, 5)); // v_cvt_f32_u32 v2, s5 (35.0)
+    code.push(vop1(3, 0x06, 6)); // v_cvt_f32_u32 v3, s6 (42.0)
+    code.extend_from_slice(&[v_mov_b32(4, LIT), 1.0f32.to_bits()]);
+
+    code.extend_from_slice(&[v_mov_b32(6, LIT), (-1.0f32).to_bits()]);
+    code.extend_from_slice(&[v_mov_b32(7, LIT), 3.0f32.to_bits()]);
+    code.push(v_cmp_eq_u32(inline_u(1), 10));
+    code.extend_from_slice(&v_cndmask_b32(6, vgpr(6), vgpr(7), VCC));
+    code.extend_from_slice(&[v_mov_b32(13, LIT), (-1.0f32).to_bits()]);
+    code.push(v_cmp_eq_u32(inline_u(2), 10));
+    code.extend_from_slice(&v_cndmask_b32(7, vgpr(13), vgpr(7), VCC));
+    code.extend_from_slice(&[v_mov_b32(8, LIT), 0.5f32.to_bits()]);
+    code.extend_from_slice(&[v_mov_b32(9, LIT), 1.0f32.to_bits()]);
+
+    // Vertices 0..2: export pos0 and param0.
+    code.push(v_cmp_gt_u32(inline_u(3), 10));
+    code.push(s_and_saveexec_b64(8, VCC));
+    let br_vtx = code.len();
+    code.push(0);
+    code.extend_from_slice(&[0xF800_00CF, 0x0908_0706]); // exp pos0 v6..v9
+    code.extend_from_slice(&[0xF800_020F, 0x0403_0201]); // exp param0 v1..v4
+    code[br_vtx] = s_cbranch_execz((code.len() - (br_vtx + 1)) as i16);
+    code.push(s_or_b64(EXEC_LO, EXEC_LO, 8));
+
+    // Thread 0: emit primitive 0 = (0, 1, 2).
+    code.push(v_cmp_eq_u32(inline_u(0), 10));
+    code.push(s_and_saveexec_b64(8, VCC));
+    let br_prim = code.len();
+    code.push(0);
+    code.extend_from_slice(&[v_mov_b32(14, LIT), (1 << 10) | (2 << 20)]);
+    code.extend_from_slice(&[0xF800_0941, 0x0000_000E]); // exp prim v14 done
+    code[br_prim] = s_cbranch_execz((code.len() - (br_prim + 1)) as i16);
+    code.push(s_or_b64(EXEC_LO, EXEC_LO, 8));
+    code.push(S_ENDPGM);
+
+    make_ms_program(
+        &code,
+        128,
+        3,
+        1,
+        0,
+        vec![VsOutput {
+            usage: Usage::Generic,
+            row: 0,
+            param: 0,
+            fp16: false,
+            pack2: false,
+        }],
+    )
+}
+
+fn mesh_wave64_wave1_readfirstlane_and_writelane_program() -> NativeProgram {
+    // Virtual wave 1 (threads 64..127) exercises:
+    // - v_readfirstlane_b32 with uniform EXEC guard (lanes >= 40 active) => picks lane 40: 140.0
+    // - v_writelane_b32 at dynamic/const lane + dynamic v_readlane_b32 => 55.0
+    // - whole-wave reduction (s_bcnt1 of even lanes 0..63) => 32.0
+    // Threads 64..66 export vertices 64..66 and thread 64 emits primitive (64, 65, 66).
+    let mut code = Vec::new();
+    code.extend_from_slice(&v_mbcnt_lo_u32_b32(0, NEG_ONE, inline_u(0)));
+    code.extend_from_slice(&v_mbcnt_hi_u32_b32(0, NEG_ONE, vgpr(0))); // v0 = lane 0..63
+    code.push(sop2(2, 0x20, 3, inline_u(24))); // s2 = wave (0 or 1)
+    code.push(sop2(2, 0x1E, 2, inline_u(6))); // s2 = wave * 64
+    code.push(v_add_nc_u32(10, 2, 0)); // v10 = full tid 0..127
+
+    // R = v_readfirstlane(v0 + 100) with EXEC = (v0 >= 40) => 140.0
+    code.extend_from_slice(&[v_mov_b32(11, LIT), 100]);
+    code.push(v_add_nc_u32(11, vgpr(11), 0));
+    code.push(v_cmp_lt_u32(inline_u(39), 0));
+    code.push(s_and_saveexec_b64(8, VCC));
+    code.push(v_readfirstlane_b32(4, 11)); // s4 = 140
+    code.push(s_or_b64(EXEC_LO, EXEC_LO, 8));
+
+    // G = v_writelane_b32 v12, 55, lane 41 + dynamic read of lane 41 => 55.0
+    code.push(v_mov_b32(12, inline_u(7)));
+    code.extend_from_slice(&v_writelane_b32(12, inline_u(55), inline_u(41)));
+    code.push(v_and_b32(13, inline_u(0), 0));
+    code.push(v_add_nc_u32(13, inline_u(41), 13));
+    code.extend_from_slice(&v_readlane_b32(5, 12, vgpr(13))); // s5 = 55
+
+    // B = s_bcnt1((v0 & 1) == 0) => 32.0
+    code.push(v_and_b32(14, inline_u(1), 0));
+    code.push(v_cmp_eq_u32(inline_u(0), 14));
+    code.push(s_bcnt1_i32_b64(6, VCC)); // s6 = 32
+
+    code.push(vop1(1, 0x06, 4));
+    code.push(vop1(2, 0x06, 5));
+    code.push(vop1(3, 0x06, 6));
+    code.extend_from_slice(&[v_mov_b32(4, LIT), 1.0f32.to_bits()]);
+
+    code.extend_from_slice(&[v_mov_b32(6, LIT), (-1.0f32).to_bits()]);
+    code.extend_from_slice(&[v_mov_b32(7, LIT), 3.0f32.to_bits()]);
+    code.extend_from_slice(&[v_mov_b32(15, LIT), 65]);
+    code.push(v_cmp_eq_u32(vgpr(15), 10));
+    code.extend_from_slice(&v_cndmask_b32(6, vgpr(6), vgpr(7), VCC));
+    code.extend_from_slice(&[v_mov_b32(16, LIT), (-1.0f32).to_bits()]);
+    code.extend_from_slice(&[v_mov_b32(15, LIT), 66]);
+    code.push(v_cmp_eq_u32(vgpr(15), 10));
+    code.extend_from_slice(&v_cndmask_b32(7, vgpr(16), vgpr(7), VCC));
+    code.extend_from_slice(&[v_mov_b32(8, LIT), 0.5f32.to_bits()]);
+    code.extend_from_slice(&[v_mov_b32(9, LIT), 1.0f32.to_bits()]);
+
+    // Vertices 64..66 (second virtual wave): export pos0 and param0.
+    code.extend_from_slice(&[v_mov_b32(15, LIT), 63]);
+    code.push(v_cmp_lt_u32(vgpr(15), 10)); // tid > 63
+    code.extend_from_slice(&[v_mov_b32(16, LIT), 67]);
+    code.push(v_cmp_gt_u32(vgpr(16), 10)); // tid < 67
+    // Use vcc = 67 > tid && tid > 63? Simpler: branch on tid - 64 < 3!
+    code.pop();
+    code.pop();
+    code.pop();
+    code.pop();
+    code.extend_from_slice(&[v_mov_b32(15, LIT), 64]);
+    code.push(v_sub_nc_u32(15, vgpr(10), 15)); // v15 = tid - 64 (wraps for < 64)
+    code.push(v_cmp_gt_u32(inline_u(3), 15)); // 3 > (tid - 64) => tid in 64..66
+    code.push(s_and_saveexec_b64(8, VCC));
+    let br_vtx = code.len();
+    code.push(0);
+    code.extend_from_slice(&[0xF800_00CF, 0x0908_0706]);
+    code.extend_from_slice(&[0xF800_020F, 0x0403_0201]);
+    code[br_vtx] = s_cbranch_execz((code.len() - (br_vtx + 1)) as i16);
+    code.push(s_or_b64(EXEC_LO, EXEC_LO, 8));
+
+    // Thread 0 emits primitive 0 = (64, 65, 66) whose vertices sit in wave 1.
+    code.push(v_cmp_eq_u32(inline_u(0), 10));
+    code.push(s_and_saveexec_b64(8, VCC));
+    let br_prim = code.len();
+    code.push(0);
+    code.extend_from_slice(&[v_mov_b32(14, LIT), 64 | (65 << 10) | (66 << 20)]);
+    code.extend_from_slice(&[0xF800_0941, 0x0000_000E]);
+    code[br_prim] = s_cbranch_execz((code.len() - (br_prim + 1)) as i16);
+    code.push(s_or_b64(EXEC_LO, EXEC_LO, 8));
+    code.push(S_ENDPGM);
+
+    make_ms_program(
+        &code,
+        128,
+        67,
+        1,
+        0,
+        vec![VsOutput {
+            usage: Usage::Generic,
+            row: 0,
+            param: 0,
+            fp16: false,
+            pack2: false,
+        }],
+    )
 }
 
 #[test]
@@ -1283,6 +1640,84 @@ mod gpu {
             64,
             &expected,
             false,
+        );
+    }
+
+    fn run_mesh_on_hosts(name: &str, prog: &NativeProgram, expected: [f32; 4]) {
+        let ps = emit_ps_rgba_passthrough();
+        with_hosts(|hosts| {
+            let mut ran = false;
+            for (warp_idx, host) in hosts.iter().enumerate() {
+                let Some(host) = host else {
+                    continue;
+                };
+                if !host.supports_mesh_shaders() {
+                    eprintln!("no mesh shader support on warp={}; skipped", warp_idx == 1);
+                    continue;
+                }
+                let warp = warp_idx == 1;
+                let mut modes = vec![Wave64Mode::Emulate];
+                if host.supports_wave32() {
+                    modes.push(Wave64Mode::Wave32);
+                }
+                for mode in modes {
+                    let ms = emit_ms(prog, mode)
+                        .unwrap_or_else(|e| panic!("{name} ({mode:?}, warp={warp}): {e}"));
+                    if let Ok(mut v) = super::super::validator::Validator::load(
+                        super::super::validator::Validator::default_path().as_deref(),
+                    ) {
+                        v.validate(&mut ms.dxil.clone())
+                            .unwrap_or_else(|e| panic!("{name} ({mode:?}) validate: {e}"));
+                    }
+                    let (root, pso) = host
+                        .mesh_pipeline(&ms, &ps)
+                        .unwrap_or_else(|e| panic!("{name} ({mode:?}, warp={warp}) PSO: {e}"));
+                    let pixels = host
+                        .draw(
+                            &root,
+                            &pso,
+                            &crate::emit::host::Draw {
+                                roots: Vec::new(),
+                                textures: &[],
+                                samplers: &[],
+                                vertices: &[],
+                                stride: 0,
+                                size: (4, 4),
+                                mesh_groups: 1,
+                            },
+                        )
+                        .unwrap_or_else(|e| panic!("{name} ({mode:?}, warp={warp}) draw: {e}"));
+                    assert_eq!(pixels.len(), 16);
+                    for px in &pixels {
+                        assert_eq!(
+                            *px, expected,
+                            "{name} ({mode:?}, warp={warp}) pixel mismatch"
+                        );
+                    }
+                    ran = true;
+                }
+            }
+            if !ran {
+                eprintln!("{name}: no mesh-capable SM 6.6 host; skipped");
+            }
+        });
+    }
+
+    #[test]
+    fn gpu_128_thread_mesh_wave64_renders_exact_wave_values() {
+        run_mesh_on_hosts(
+            "mesh_wave64_wave0",
+            &mesh_wave64_triangle_program(),
+            [29.0, 35.0, 42.0, 1.0],
+        );
+    }
+
+    #[test]
+    fn gpu_128_thread_mesh_wave64_wave1_readfirstlane_and_writelane() {
+        run_mesh_on_hosts(
+            "mesh_wave64_wave1",
+            &mesh_wave64_wave1_readfirstlane_and_writelane_program(),
+            [140.0, 55.0, 32.0, 1.0],
         );
     }
 }

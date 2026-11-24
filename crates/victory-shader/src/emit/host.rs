@@ -141,6 +141,21 @@ impl Host {
         ops && min <= 32 && max >= 32
     }
 
+    /// Whether the host supports D3D12 mesh shaders (Tier 1+).
+    pub fn supports_mesh_shaders(&self) -> bool {
+        let mut opts = D3D12_FEATURE_DATA_D3D12_OPTIONS7::default();
+        // SAFETY: plain D3D12 feature query with valid struct size.
+        let ok = unsafe {
+            self.device.CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS7,
+                (&raw mut opts).cast(),
+                size_of_val(&opts) as u32,
+            )
+        }
+        .is_ok();
+        ok && opts.MeshShaderTier != D3D12_MESH_SHADER_TIER_NOT_SUPPORTED
+    }
+
     /// Best Wave64 compute lowering strategy supported by this host device.
     pub fn recommended_wave64_mode(&self) -> Wave64Mode {
         if self.supports_wave64() {

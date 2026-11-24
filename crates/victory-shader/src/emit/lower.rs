@@ -876,6 +876,57 @@ impl<'a> Lower<'a> {
         let mut uniform = Vec::new();
         let mut val_uniform = Vec::new();
         let mut cross_block_masks = HashMap::new();
+        let mut mask_data = match x.native.stage {
+            HwStage::Cs => MaskData::Console,
+            HwStage::Ps | HwStage::Vs => MaskData::Host,
+            _ => MaskData::None,
+        };
+        let has_lds_mem = insts()
+            .any(|i| matches!(i.fields, Fields::Ds { .. }) && i.name() != "ds_swizzle_b32");
+        let is_quad_ds = |i: &Inst| {
+            i.name() == "ds_swizzle_b32"
+                && matches!(&i.fields, Fields::Ds { offset0, offset1, .. } if {
+                    let off = u32::from(*offset0) | (u32::from(*offset1) << 8);
+                    off & 0x8000 != 0
+                        || (off & 0x1C == 0x1C && off & 0x380 == 0 && (off >> 10) & 0x1F < 4)
+                })
+        };
+        let lane_read_needs = |spills: &HashMap<Site, Moved>, val_uniform: &[bool]| {
+            let has_non_uniform_firstlane = insts().any(|i| {
+                i.name() == "v_readfirstlane_b32"
+                    && matches!(
+                        &i.fields,
+                        Fields::Valu(v)
+                            if matches!(v.src.first(), Some(Operand::Vector { reg, .. })
+                                if i.read(Reg::V(*reg)).is_some_and(|val| !val_uniform[val.0 as usize]))
+                    )
+            });
+            let has_unresolved_readlane = p.blocks.iter().enumerate().any(|(b, blk)| {
+                blk.insts.iter().enumerate().any(|(i, inst)| {
+                    inst.name() == "v_readlane_b32" && !spills.contains_key(&(b, i))
+                })
+            });
+            (has_non_uniform_firstlane, has_unresolved_readlane)
+        };
+        let setup_emulate_lds = |title_lds: u32,
+                                 threads: u32,
+                                 need_exchange: bool,
+                                 s: &mut Shader,
+                                 virtual_waves: &mut u32,
+                                 ballot_stride: &mut u32,
+                                 ballot_base: &mut u32,
+                                 exchange_base: &mut u32,
+                                 lds_overflow: &mut bool| {
+            *virtual_waves = threads.div_ceil(64);
+            *ballot_stride = 2;
+            let ballot_dwords = 2 * *virtual_waves;
+            let exchange_dwords = if need_exchange { 64 * *virtual_waves } else { 0 };
+            *ballot_base = title_lds;
+            *exchange_base = title_lds + ballot_dwords;
+            let emu_dwords = ballot_dwords + exchange_dwords;
+            s.lds_dwords = title_lds.saturating_add(emu_dwords);
+            *lds_overflow = emu_dwords > 0 && s.lds_dwords > 8192;
+        };
 
         if let StageIo::Cs(cs) = x.native.io {
             s.threads = Some(cs.threads);
@@ -923,8 +974,6 @@ impl<'a> Lower<'a> {
             } else {
                 Wave64Mode::Native
             };
-            let has_lds_mem = insts()
-                .any(|i| matches!(i.fields, Fields::Ds { .. }) && i.name() != "ds_swizzle_b32");
             let has_swizzle_or_dpp = insts().any(|i| {
                 i.name().starts_with("ds_swizzle")
                     || i.name().contains("permute")
@@ -942,20 +991,8 @@ impl<'a> Lower<'a> {
                 Wave64Mode::Wave32 | Wave64Mode::Emulate => {
                     spills = spilled_sgprs(p);
                     (uniform, val_uniform) = compute_uniformity(p, x.st, x.res, &x.io.inputs);
-                    let has_non_uniform_firstlane = insts().any(|i| {
-                        i.name() == "v_readfirstlane_b32"
-                            && matches!(
-                                &i.fields,
-                                Fields::Valu(v)
-                                    if matches!(v.src.first(), Some(Operand::Vector { reg, .. })
-                                        if i.read(Reg::V(*reg)).is_some_and(|val| !val_uniform[val.0 as usize]))
-                            )
-                    });
-                    let has_unresolved_readlane = p.blocks.iter().enumerate().any(|(b, blk)| {
-                        blk.insts.iter().enumerate().any(|(i, inst)| {
-                            inst.name() == "v_readlane_b32" && !spills.contains_key(&(b, i))
-                        })
-                    });
+                    let (has_non_uniform_firstlane, has_unresolved_readlane) =
+                        lane_read_needs(&spills, &val_uniform);
                     let need_emu =
                         console_lanes || !sections.is_empty() || has_non_uniform_firstlane;
 
@@ -993,22 +1030,20 @@ impl<'a> Lower<'a> {
                         // Wave64Mode::Emulate (`s.wave_size = None`).
                         if need_emu {
                             wave64 = Wave64Mode::Emulate;
-                            virtual_waves = total_threads.div_ceil(64);
-                            ballot_stride = 2;
-                            let ballot_dwords = 2 * virtual_waves;
-                            let exchange_dwords = if !sections.is_empty()
+                            let need_exchange = !sections.is_empty()
                                 || has_unresolved_readlane
-                                || has_swizzle_or_dpp
-                            {
-                                64 * virtual_waves
-                            } else {
-                                0
-                            };
-                            ballot_base = title_lds_dwords;
-                            exchange_base = title_lds_dwords + ballot_dwords;
-                            let emu_dwords = ballot_dwords + exchange_dwords;
-                            s.lds_dwords = title_lds_dwords.saturating_add(emu_dwords);
-                            lds_overflow = emu_dwords > 0 && s.lds_dwords > 8192;
+                                || has_swizzle_or_dpp;
+                            setup_emulate_lds(
+                                title_lds_dwords,
+                                total_threads,
+                                need_exchange,
+                                &mut s,
+                                &mut virtual_waves,
+                                &mut ballot_stride,
+                                &mut ballot_base,
+                                &mut exchange_base,
+                                &mut lds_overflow,
+                            );
                             cross_block_masks = collect_cross_block_masks(p, x.st, &def_block);
                         }
                         if total_threads > 1 && total_threads <= 64 && has_lds_mem {
@@ -1021,6 +1056,7 @@ impl<'a> Lower<'a> {
         let mut no_barrier = HashSet::new();
         if let StageIo::Ms(ms) = &x.native.io {
             s.prims = x.prims.clone();
+            total_threads = ms.threads;
             s.threads = Some([ms.threads, 1, 1]);
             title_lds_dwords = ms.lds_bytes.div_ceil(4);
             s.lds_dwords = title_lds_dwords;
@@ -1029,6 +1065,55 @@ impl<'a> Lower<'a> {
                 max_primitives: ms.max_primitives,
                 topology: ms.topology,
             });
+            // D3D12 mesh shaders cannot declare `WaveSize(64)`, so on Wave32 and
+            // narrower hosts any Wave64 lane/mask/reduction semantics lower
+            // through portable group-shared memory (`Emulate`).
+            if x.native.wave64 && x.options.wave64 != Wave64Mode::Native {
+                spills = spilled_sgprs(p);
+                (uniform, val_uniform) = compute_uniformity(p, x.st, x.res, &x.io.inputs);
+                let (has_non_uniform_firstlane, has_unresolved_readlane) =
+                    lane_read_needs(&spills, &val_uniform);
+                let has_writelane = insts().any(|i| i.name() == "v_writelane_b32");
+                let has_mask_read_as_data = insts().any(|i| reads_mask_as_data(x.st, i));
+                let has_non_quad_swizzle_or_dpp = insts().any(|i| {
+                    (i.name().starts_with("ds_swizzle") && !is_quad_ds(i))
+                        || i.name().contains("permute")
+                        || matches!(&i.fields, Fields::Valu(v) if matches!(v.dpp, Some(d) if !matches!(d, Dpp::Row { ctrl: 0..=0xFF, .. })))
+                });
+                let need_emu = !sections.is_empty()
+                    || has_non_uniform_firstlane
+                    || has_unresolved_readlane
+                    || has_writelane
+                    || has_mask_read_as_data
+                    || has_non_quad_swizzle_or_dpp;
+                if need_emu {
+                    wave64 = Wave64Mode::Emulate;
+                    mask_data = MaskData::Console;
+                    let need_exchange = !sections.is_empty()
+                        || has_unresolved_readlane
+                        || has_non_quad_swizzle_or_dpp;
+                    setup_emulate_lds(
+                        title_lds_dwords,
+                        total_threads,
+                        need_exchange,
+                        &mut s,
+                        &mut virtual_waves,
+                        &mut ballot_stride,
+                        &mut ballot_base,
+                        &mut exchange_base,
+                        &mut lds_overflow,
+                    );
+                    cross_block_masks = collect_cross_block_masks(p, x.st, &def_block);
+                }
+                let max_single = if x.options.wave64 == Wave64Mode::Wave32 {
+                    total_threads > 32
+                } else {
+                    total_threads > 1
+                };
+                if max_single && total_threads <= 64 && has_lds_mem {
+                    need_lds_barriers = true;
+                }
+            }
             // Barriers order the lanes' LDS accesses; the console's
             // allocation request needs them too, but the host does not. One
             // lane sends that request, and what it dominates (the path for
@@ -1120,11 +1205,7 @@ impl<'a> Lower<'a> {
             flat: None,
             no_barrier,
             half_outputs: half_outputs(&x.native.io, &x.outputs),
-            mask_data: match x.native.stage {
-                HwStage::Cs => MaskData::Console,
-                HwStage::Ps | HwStage::Vs => MaskData::Host,
-                _ => MaskData::None,
-            },
+            mask_data,
             mask_ok: false,
             ballots: HashMap::new(),
             balloting: HashSet::new(),
@@ -1310,14 +1391,18 @@ impl<'a> Lower<'a> {
         }
         let e = self.s.entry;
         let i32t = self.s.t.i32;
-        let flat_in = self.s.op(
-            e,
-            "flattenedThreadIdInGroup.i32",
-            Attr::ReadNone,
-            i32t,
-            96,
-            &[],
-        );
+        let flat_in = if self.s.mesh.is_some() {
+            self.mesh_thread()
+        } else {
+            self.s.op(
+                e,
+                "flattenedThreadIdInGroup.i32",
+                Attr::ReadNone,
+                i32t,
+                96,
+                &[],
+            )
+        };
         let flat = if self.wave64 == Wave64Mode::Emulate {
             flat_in
         } else {
@@ -1478,11 +1563,15 @@ impl<'a> Lower<'a> {
     fn emulated_readfirstlane(&mut self, val: V, guard: Option<V>) -> Result<V, Why> {
         let divergent =
             self.guard_depth > 0 || !self.uniform.get(self.cur_ir).copied().unwrap_or(false);
-        if divergent && self.wave64 != Wave64Mode::Wave32 {
+        let host_wave32 = self.wave64 == Wave64Mode::Wave32
+            || (self.s.mesh.is_some()
+                && divergent
+                && self.x.options.wave64 == Wave64Mode::Wave32);
+        if divergent && !host_wave32 {
             return Err("v_readfirstlane in divergent control flow");
         }
         let act = guard.unwrap_or_else(|| self.s.m.bool(true));
-        if self.wave64 == Wave64Mode::Wave32 {
+        if host_wave32 {
             let c = self.cur;
             let i32t = self.s.t.i32;
             let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
@@ -3051,10 +3140,9 @@ impl<'a> Lower<'a> {
     /// the console's wave size (lanes are thread ids in group order there).
     /// Pixel lanes match only within a quad.
     fn cross_lane(&mut self, quad: bool) -> Result<(), Why> {
-        if self.s.mesh.is_some() {
-            // shortcut: no wave size for mesh shaders in SM 6.6, so host
-            // lanes cannot follow the console's; emulate through group-shared
-            // memory if mesh programs turn out to need these.
+        if self.s.mesh.is_some() && !self.emulating_wave64() {
+            // shortcut: no wave size for mesh shaders in SM 6.6, so without
+            // Wave64 emulation host lanes cannot follow the console's.
             return Err("a cross-lane operation in a mesh shader");
         }
         if self.s.threads.is_none() && !(quad && self.s.pixel) {
