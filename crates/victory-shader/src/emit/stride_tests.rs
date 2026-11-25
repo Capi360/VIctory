@@ -328,22 +328,27 @@ fn a_heap_buffer_read_where_no_buffer_view_is_reads_zeros() {
         let (root, pso) = host
             .compute_pipeline(&shader)
             .unwrap_or_else(|e| panic!("{label}: compute_pipeline failed: {e}"));
-        let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
-        for u in &shader.user_data {
-            // The texture at heap index 1, the UAV's table at 0.
-            ud[u.index as usize] = u32::from(u.root == RootType::Constants);
+        for index in [1, super::HEAP_VIEWS + 7] {
+            let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+            for u in &shader.user_data {
+                if u.root == RootType::Constants {
+                    ud[u.index as usize] = index;
+                }
+            }
+            // The texture's stride and the last, reserved stride entry are both zero.
+            let mut strides = vec![0; super::HEAP_VIEWS as usize];
+            strides[0] = 4;
+            let dispatch = Dispatch {
+                roots: vec![(0, Root::Constants(ud)), (1, Root::View { srv: true, data: strides })],
+                views: &views,
+                samplers: &[],
+                groups: [1, 1, 1],
+            };
+            let words = host
+                .dispatch(&root, &pso, &dispatch)
+                .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
+            assert_eq!(words[0], [0; 32], "{label}: index {index}");
         }
-        let dispatch = Dispatch {
-            // Heap index 1 holds no buffer view: stride 0.
-            roots: vec![(0, Root::Constants(ud)), (1, Root::View { srv: true, data: vec![4, 0] })],
-            views: &views,
-            samplers: &[],
-            groups: [1, 1, 1],
-        };
-        let words = host
-            .dispatch(&root, &pso, &dispatch)
-            .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
-        assert_eq!(words[0], [0; 32], "{label}");
         ran += 1;
     }
     assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");

@@ -171,7 +171,12 @@ pub(crate) fn sync_heaps() {
             continue;
         };
         let step = u64::from(step);
+        let mirror_end = (start + u64::from(host.count()) * step) as usize;
         for (from, to) in written.take(start as usize, usize::MAX) {
+            let to = to.min(mirror_end);
+            if from >= to {
+                continue;
+            }
             // By page: one with nothing mapped (the title unmaps heap pages
             // too) holds no records.
             let page_size = crate::watch::PAGE;
@@ -181,7 +186,7 @@ pub(crate) fn sync_heaps() {
                     continue;
                 }
                 let (first, last) = ((page as u64 - start) / step, (end as u64 - start).div_ceil(step));
-                for index in first..last.min(u64::from(heap.desc.count)) {
+                for index in first..last.min(u64::from(host.count())) {
                     host.mirror(index as u32, start + index * step, false);
                 }
             }
