@@ -1530,7 +1530,7 @@ impl State {
         arguments: u64,
         count: Option<u64>,
     ) -> bool {
-        // Skip before the argument clamp can mutate the indirect buffer.
+        // Skip before using indirect scratch space or the list budget.
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
             crate::pipeline::note_drop(self.pipeline as This);
@@ -1550,20 +1550,29 @@ impl State {
         };
         #[cfg(not(feature = "diagnostics"))]
         let why = |_: &str| {};
-        // A call with no host pipeline cannot run, and that is the common
-        // case while the world builds its pipelines: #400 measures 1 400-1 750
-        // indirect calls a frame dropped this way. Drop it here, before the
-        // argument refresh and the clamp dispatch, which would otherwise copy
-        // the arguments and dispatch a compute shader for records nothing
-        // reads. Same order as the `is_skipped` check above, for the same
-        // reason.
-        if crate::pipeline::host_pipeline(self.pipeline as This).is_none() {
+        let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
             #[cfg(feature = "diagnostics")]
             crate::pipeline::note_drop(self.pipeline as This);
             why("no host pipeline");
             return false;
+        };
+        let matches_kind = match kind {
+            DRAW | INDEXED => !p.compute && !p.mesh,
+            MESH => !p.compute && p.mesh,
+            DISPATCH => p.compute,
+            _ => false,
+        };
+        if !matches_kind {
+            why(&format!(
+                "pipeline mismatch (compute {}, mesh {}, topology {})",
+                p.compute, p.mesh, self.topology
+            ));
+            return false;
         }
-        let len = u64::from(stride) * u64::from(max.max(1));
+        let Some(len) = crate::indirect::required_bytes(kind, stride, max) else {
+            why("invalid indirect layout");
+            return false;
+        };
         let Some(args) = crate::shadow::find(arguments, len) else {
             why("arguments outside title buffers");
             return false;
@@ -1589,11 +1598,18 @@ impl State {
         if let Some((s, at)) = &counter {
             s.refresh(list, *at, 4);
         }
-        // Bounded first: the clamp binds a compute pipeline of its own.
-        if !crate::indirect::bound(list, &args.buffer, args.gpu(arguments), (kind, stride, max)) {
+        // Bounded first: the clamp binds a compute pipeline of its own and
+        // copies clamped active records into a bump-allocated scratch slice.
+        let count_arg = counter.as_ref().map(|(s, at)| (&s.buffer, s.offset(*at)));
+        let Some(bounded) = crate::indirect::bound(
+            list,
+            (&args.buffer, args.offset(arguments)),
+            count_arg,
+            (kind, stride, max),
+        ) else {
             why("not bounded (no clamp, or arguments not 4-byte aligned)");
             return false;
-        }
+        };
         self.host_pipeline = 0;
         self.host_roots[1] = 0;
         let ran = match kind {
@@ -1611,7 +1627,7 @@ impl State {
             _ => false,
         };
         if !ran {
-            crate::indirect::done(list, &args.buffer);
+            crate::indirect::done(list, &bounded);
             #[cfg(feature = "diagnostics")]
             match crate::pipeline::host_pipeline(self.pipeline as This) {
                 None => {
@@ -1629,16 +1645,19 @@ impl State {
         }
         #[cfg(feature = "diagnostics")]
         list.note_op(|| {
-            self.op_text(format!("indirect kind {kind} max {max} at {arguments:#x}"), kind == DISPATCH)
+            self.op_text(
+                format!("indirect kind {kind} max {max} at {arguments:#x}"),
+                kind == DISPATCH,
+            )
         });
-        // SAFETY: an open list with everything set; the buffers are host
-        // copies the list keeps alive (refresh), the signature is cached.
+        // SAFETY: an open list with everything set; the scratch buffer and
+        // host copies are kept alive by the list, and the signature is cached.
         unsafe {
             list.list.ExecuteIndirect(
                 &signature,
                 max,
-                &args.buffer,
-                args.offset(arguments),
+                &bounded.scratch,
+                bounded.offset,
                 counter.as_ref().map(|(s, _)| &s.buffer),
                 counter.as_ref().map_or(0, |(s, at)| s.offset(*at)),
             )
@@ -1648,9 +1667,9 @@ impl State {
         if crate::capture::dump_on() {
             let count = counter.as_ref().map(|(s, at)| (&s.buffer, s.offset(*at)));
             let name = crate::pipeline::shaders_of(pipeline);
-            crate::capture::read_indirect(list, (&args.buffer, args.offset(arguments)), count, (kind, stride, max), name);
+            crate::capture::read_indirect(list, (&bounded.scratch, bounded.offset), count, (kind, stride, max), name);
         }
-        crate::indirect::done(list, &args.buffer);
+        crate::indirect::done(list, &bounded);
         if kind == DISPATCH {
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
         } else {

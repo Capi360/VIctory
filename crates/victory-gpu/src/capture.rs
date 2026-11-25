@@ -441,7 +441,7 @@ pub(crate) fn read_indirect(
     // SAFETY: as above.
     unsafe impl Sync for Readback {}
     let Some(host) = crate::host::host() else { return };
-    let len = u64::from(stride) * u64::from(max.max(1));
+    let Some(len) = crate::indirect::required_bytes(kind, stride, max).filter(|&len| len > 0) else { return };
     let desc = D3D12_RESOURCE_DESC {
         Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
         Width: len + 4,
@@ -473,7 +473,7 @@ pub(crate) fn read_indirect(
         l.CopyBufferRegion(&buffer, 0, args.0, args.1, len);
         if let Some((c, at)) = count {
             let same = c.as_raw() == args.0.as_raw();
-            let state = if same { copy } else { D3D12_RESOURCE_STATE_UNORDERED_ACCESS };
+            let state = if same { copy } else { crate::indirect::READ };
             if !same {
                 l.ResourceBarrier(&[transition(c, state, copy)]);
             }
@@ -499,7 +499,8 @@ pub(crate) fn read_indirect(
             let n = counted.then(|| words[len as usize / 4]);
             let records = n.unwrap_or(max).min(max) as usize;
             let step = stride as usize / 4;
-            let first = |r: usize| &words[r * step..r * step + step.min(4)];
+            let payload = crate::indirect::payload_size(kind).unwrap() as usize / 4;
+            let first = |r: usize| &words[r * step..r * step + payload.min(4)];
             // Draws: vertices (or indices) × instances; dispatches: groups.
             let work = |r: usize| -> u64 {
                 let w = first(r);
