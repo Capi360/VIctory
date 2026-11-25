@@ -1865,6 +1865,8 @@ pub(crate) fn stencil_ref(list: &HostList, reference: u32) {
 
 #[cfg(test)]
 mod tests {
+    mod descriptor_counts;
+
     use super::*;
     use crate::object::{HRESULT, S_OK};
     use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;

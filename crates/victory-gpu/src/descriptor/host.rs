@@ -803,67 +803,84 @@ fn element_size(desc: &D3D12_SHADER_RESOURCE_VIEW_DESC) -> u64 {
     }
 }
 
-/// Writes slot `index`'s view address into the view addresses at `data`: a
-/// buffer view's title address (dword 0 low, dword 1 bits 0-15 high), its
-/// record count (dword 2) and its format and type (dword 3), the last two
-/// as the title's own descriptor holds them; zeros for anything else.
+/// Writes the title address and record count a shader can read as data.
 fn write_address(data: usize, index: usize, view: Option<&View>) {
-    let address = view.and_then(buffer_range).map_or(0, |(a, _)| a);
-    let words = view
-        .filter(|v| buffer_range(v).is_some())
-        .and_then(buffer_words)
-        .unwrap_or([0; 10]);
-    let table = [
-        address as u32,
-        (address >> 32) as u32 & 0xFFFF,
-        words[2],
-        words[3],
-    ];
+    let table = view.and_then(buffer_view).map_or([0; 4], |v| {
+        [
+            v.address as u32,
+            (v.address >> 32) as u32 & 0xffff,
+            v.records,
+            v.word3,
+        ]
+    });
     // SAFETY: the mapped view addresses hold 16 bytes per title slot.
     unsafe { ((data + 16 * index) as *mut [u32; 4]).write_unaligned(table) };
 }
 
-/// The title's own descriptor words of a buffer view (the console's buffer
-/// descriptor, 10 dwords), for the fields a shader reads as data.
-fn buffer_words(view: &View) -> Option<[u32; 10]> {
-    match view {
-        View::Shader(_, Some(desc)) => Some(*desc),
-        View::Unordered(_, _, Some(desc)) => Some(*desc),
-        View::Placed(_, resource, words) if resource[0] == 1 => words[..10].try_into().ok(),
-        _ => None,
-    }
+struct BufferView {
+    address: u64,
+    bytes: u64,
+    records: u32,
+    // TODO: encode the guest format/type word from the view description.
+    word3: u32,
 }
 
 /// The title memory a buffer shader or unordered access view reads: its
 /// address and length.
 pub(crate) fn buffer_range(view: &View) -> Option<(u64, u64)> {
-    let (base, words): (u64, &[u32; 10]) = match view {
-        View::Shader(r, Some(desc)) => (
+    buffer_view(view).map(|v| (v.address, v.bytes))
+}
+
+fn buffer_view(view: &View) -> Option<BufferView> {
+    let (base, unordered, words): (u64, bool, &[u32; 10]) = match view {
+        View::Shader(r, Some(desc)) | View::Unordered(r, _, Some(desc)) => (
             crate::resource::buffer_bytes(*r as crate::object::This)?.0 as u64,
+            matches!(view, View::Unordered(..)),
             desc,
         ),
-        View::Placed(false, resource, desc) if resource[0] == 1 => (
+        View::Placed(unordered, resource, desc) if resource[0] == 1 => (
             u64::from(desc[10]) | u64::from(desc[11]) << 32,
+            *unordered,
             desc[..10].try_into().ok()?,
         ),
-        View::Unordered(r, _, Some(desc)) => {
-            let base = crate::resource::buffer_bytes(*r as crate::object::This)?.0 as u64;
-            return unordered_range(base, desc);
-        }
-        View::Placed(true, resource, desc) if resource[0] == 1 => {
-            let base = u64::from(desc[10]) | u64::from(desc[11]) << 32;
-            return unordered_range(base, desc[..10].try_into().ok()?);
-        }
         _ => return None,
     };
-    let desc = srv_desc(words);
-    let element = element_size(&desc);
-    // SAFETY: a buffer view's union member.
-    let buffer = unsafe { desc.Anonymous.Buffer };
-    Some((
-        base + buffer.FirstElement * element,
-        u64::from(buffer.NumElements) * element,
-    ))
+    // Buffer is dimension 1 in both the SRV and UAV descriptions.
+    if words[1] != 1 {
+        return None;
+    }
+    let (first, count, element, raw) = if unordered {
+        let desc = uav_desc(words);
+        // SAFETY: the dimension selects the Buffer union member.
+        let buffer = unsafe { desc.Anonymous.Buffer };
+        let raw = buffer.Flags.0 & D3D12_BUFFER_UAV_FLAG_RAW.0 != 0;
+        let element = if buffer.StructureByteStride > 0 {
+            u64::from(buffer.StructureByteStride)
+        } else if raw {
+            4
+        } else {
+            crate::resource::element(desc.Format.0 as u32)?.0
+        };
+        (buffer.FirstElement, buffer.NumElements, element, raw)
+    } else {
+        let desc = srv_desc(words);
+        // SAFETY: the dimension selects the Buffer union member.
+        let buffer = unsafe { desc.Anonymous.Buffer };
+        let raw = buffer.Flags.0 & D3D12_BUFFER_SRV_FLAG_RAW.0 != 0;
+        (buffer.FirstElement, buffer.NumElements, element_size(&desc), raw)
+    };
+    if element == 0 {
+        return None;
+    }
+    let bytes = u64::from(count) * element;
+    Some(BufferView {
+        address: base.checked_add(first.checked_mul(element)?)?,
+        bytes,
+        // D3D12 counts raw views in dwords; the shader reads a byte count.
+        // Cap larger ranges at the largest byte bound the field can hold.
+        records: if raw { count.saturating_mul(4) } else { count },
+        word3: words[3],
+    })
 }
 
 /// The host copy a buffer view's bytes are in (the one its host view
@@ -872,24 +889,6 @@ pub(crate) fn view_copy(view: &View) -> Option<(std::sync::Arc<crate::shadow::Sh
     let (address, len) = buffer_range(view)?;
     let (shadow, _) = crate::shadow::for_view(address, len, u64::from(view_stride(view)))?;
     Some((shadow, address, len))
-}
-
-/// [`buffer_range`] of an unordered access view of memory at `base`.
-fn unordered_range(base: u64, words: &[u32; 10]) -> Option<(u64, u64)> {
-    let desc = uav_desc(words);
-    // SAFETY: a buffer view's union member.
-    let buffer = unsafe { desc.Anonymous.Buffer };
-    let element = if buffer.StructureByteStride > 0 {
-        u64::from(buffer.StructureByteStride)
-    } else if buffer.Flags.0 & D3D12_BUFFER_UAV_FLAG_RAW.0 != 0 {
-        4
-    } else {
-        crate::resource::element(desc.Format.0 as u32)?.0
-    };
-    Some((
-        base + buffer.FirstElement * element,
-        u64::from(buffer.NumElements) * element,
-    ))
 }
 
 /// The host resource a slot made by [`make`] views, if any, and the view's
@@ -1448,6 +1447,40 @@ fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn views_without_a_buffer_element_clear_the_table_entry() {
+        let mut resource = [0; 14];
+        resource[0] = 1;
+        for (dimension, format) in [
+            (D3D12_SRV_DIMENSION_TEXTURE2D, DXGI_FORMAT_R32_UINT),
+            (D3D12_SRV_DIMENSION_BUFFER, DXGI_FORMAT_UNKNOWN),
+        ] {
+            let mut words = [0; 16];
+            words[0] = format.0 as u32;
+            words[1] = dimension.0 as u32;
+            words[6] = 37;
+            let view = View::Placed(false, resource, words);
+            let mut entry = [u32::MAX; 4];
+            write_address(entry.as_mut_ptr() as usize, 0, Some(&view));
+            assert_eq!(entry, [0; 4]);
+        }
+    }
+
+    #[test]
+    fn raw_record_bound_keeps_the_byte_range_beyond_u32() {
+        let mut resource = [0; 14];
+        resource[0] = 1; // buffer
+        let mut words = [0; 16];
+        words[0] = DXGI_FORMAT_R32_TYPELESS.0 as u32;
+        words[1] = D3D12_SRV_DIMENSION_BUFFER.0 as u32;
+        words[2] = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        words[6] = 1 << 30; // 4 GiB in dwords
+        words[8] = D3D12_BUFFER_SRV_FLAG_RAW.0 as u32;
+        let view = buffer_view(&View::Placed(false, resource, words)).unwrap();
+        assert_eq!(view.bytes, 1u64 << 32);
+        assert_eq!(view.records, u32::MAX);
+    }
 
     /// The world's 16-byte view of 0 elements removed the device.
     #[test]
