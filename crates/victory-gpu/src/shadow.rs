@@ -898,7 +898,8 @@ fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
 
 /// The copy a buffer view of `len` bytes at `address`, whose elements are
 /// `element` bytes, reads: the innermost title buffer's ([`find`]), unless
-/// the view does not start on an element of that copy. A host view counts
+/// the view does not start on an element or meet the host's byte alignment.
+/// A host view counts
 /// its first element from its buffer's start; a console view starts at any
 /// address, and the title places structured views at ring positions inside
 /// its big GPU heap (the meshlet culling's 456-byte constants, the colour
@@ -906,9 +907,10 @@ fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
 /// culled). Such a view gets a copy of its own bytes, starting at its
 /// address (`true` with it), which lives while a heap slot made from the
 /// view or a list holds it.
-pub(crate) fn for_view(address: u64, len: u64, element: u64) -> Option<(Arc<Shadow>, bool)> {
+pub(crate) fn for_view(address: u64, len: u64, element: u64, alignment: u64) -> Option<(Arc<Shadow>, bool)> {
     let shadow = find(address, len)?;
-    if element == 0 || shadow.offset(address).is_multiple_of(element) {
+    let offset = shadow.offset(address);
+    if (element == 0 || offset.is_multiple_of(element)) && offset.is_multiple_of(alignment) {
         return Some((shadow, false));
     }
     #[cfg(feature = "diagnostics")]

@@ -822,6 +822,28 @@ fn write_address(data: usize, index: usize, view: Option<&View>) {
 /// The title memory a buffer shader or unordered access view reads: its
 /// address and length.
 pub(crate) fn buffer_range(view: &View) -> Option<(u64, u64)> {
+    let range = buffer_span(view)?;
+    Some((range.address, range.len))
+}
+
+struct BufferSpan {
+    address: u64,
+    len: u64,
+    element: u64,
+    alignment: u64,
+}
+
+fn raw_structured(stride: u32) -> bool {
+    stride > 0 && stride.is_multiple_of(4)
+}
+
+fn view_alignment(stride: u32) -> u64 {
+    // A structured view lowered to raw access must start at a raw SRV/UAV
+    // boundary. Use the same alignment when finding the copy to refresh.
+    if raw_structured(stride) { 16 } else { 1 }
+}
+
+fn buffer_span(view: &View) -> Option<BufferSpan> {
     let (base, words): (u64, &[u32; 10]) = match view {
         View::Shader(r, Some(desc)) => (
             crate::resource::buffer_bytes(*r as crate::object::This)?.0 as u64,
@@ -845,22 +867,24 @@ pub(crate) fn buffer_range(view: &View) -> Option<(u64, u64)> {
     let element = element_size(&desc);
     // SAFETY: a buffer view's union member.
     let buffer = unsafe { desc.Anonymous.Buffer };
-    Some((
-        base + buffer.FirstElement * element,
-        u64::from(buffer.NumElements) * element,
-    ))
+    Some(BufferSpan {
+        address: base + buffer.FirstElement * element,
+        len: u64::from(buffer.NumElements) * element,
+        element,
+        alignment: view_alignment(buffer.StructureByteStride),
+    })
 }
 
 /// The host copy a buffer view's bytes are in (the one its host view
 /// reads, [`crate::shadow::for_view`]) and the view's title range.
 pub(crate) fn view_copy(view: &View) -> Option<(std::sync::Arc<crate::shadow::Shadow>, u64, u64)> {
-    let (address, len) = buffer_range(view)?;
-    let (shadow, _) = crate::shadow::for_view(address, len, u64::from(view_stride(view)))?;
-    Some((shadow, address, len))
+    let span = buffer_span(view)?;
+    let (shadow, _) = crate::shadow::for_view(span.address, span.len, span.element, span.alignment)?;
+    Some((shadow, span.address, span.len))
 }
 
 /// [`buffer_range`] of an unordered access view of memory at `base`.
-fn unordered_range(base: u64, words: &[u32; 10]) -> Option<(u64, u64)> {
+fn unordered_range(base: u64, words: &[u32; 10]) -> Option<BufferSpan> {
     let desc = uav_desc(words);
     // SAFETY: a buffer view's union member.
     let buffer = unsafe { desc.Anonymous.Buffer };
@@ -871,10 +895,12 @@ fn unordered_range(base: u64, words: &[u32; 10]) -> Option<(u64, u64)> {
     } else {
         crate::resource::element(desc.Format.0 as u32)?.0
     };
-    Some((
-        base + buffer.FirstElement * element,
-        u64::from(buffer.NumElements) * element,
-    ))
+    Some(BufferSpan {
+        address: base + buffer.FirstElement * element,
+        len: u64::from(buffer.NumElements) * element,
+        element,
+        alignment: view_alignment(buffer.StructureByteStride),
+    })
 }
 
 /// The host resource a slot made by [`make`] views, if any, and the view's
@@ -901,9 +927,12 @@ fn buffer_srv(
     }
     // The copy its own bytes are in, its first element counted from there.
     let start = address + buffer.FirstElement * element;
-    let Some((shadow, own)) =
-        crate::shadow::for_view(start, u64::from(buffer.NumElements) * element, element)
-    else {
+    let Some((shadow, own)) = crate::shadow::for_view(
+        start,
+        u64::from(buffer.NumElements) * element,
+        element,
+        view_alignment(buffer.StructureByteStride),
+    ) else {
         #[cfg(feature = "diagnostics")]
         if REFUSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 200 {
             tracing::info!(start = format_args!("{start:#x}"), len, element, count = buffer.NumElements, "refused buffer view: no host copy");
@@ -920,10 +949,7 @@ fn buffer_srv(
         once!(first, count, element, "buffer view empty or past its host copy");
         return None;
     }
-    if buffer.StructureByteStride > 0
-        && element.is_multiple_of(4)
-        && (first * element).is_multiple_of(16)
-    {
+    if raw_structured(buffer.StructureByteStride) {
         // NVIDIA multiplies `rawBufferLoad` byte offsets by `StructureByteStride`,
         // so expose structured buffers as raw dwords (`host_raw_structured`).
         // D3D12 requires raw SRVs to start on a 16-byte boundary.
@@ -980,7 +1006,12 @@ fn buffer_uav(
         return None;
     }
     let start = address + buffer.FirstElement * element;
-    let (shadow, own) = crate::shadow::for_view(start, u64::from(buffer.NumElements) * element, element)?;
+    let (shadow, own) = crate::shadow::for_view(
+        start,
+        u64::from(buffer.NumElements) * element,
+        element,
+        view_alignment(buffer.StructureByteStride),
+    )?;
     // SAFETY: a live buffer.
     let flags = unsafe { shadow.buffer.GetDesc() }.Flags;
     if flags.0 & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 == 0 {
@@ -994,10 +1025,7 @@ fn buffer_uav(
         once!(first, count, element, "unordered buffer view empty or past its host copy");
         return None;
     }
-    if buffer.StructureByteStride > 0
-        && element.is_multiple_of(4)
-        && (first * element).is_multiple_of(16)
-    {
+    if raw_structured(buffer.StructureByteStride) {
         buffer.FirstElement = first * (element / 4);
         buffer.NumElements =
             (u64::from(count) * (element / 4)).min(u64::from(u32::MAX)) as u32;
